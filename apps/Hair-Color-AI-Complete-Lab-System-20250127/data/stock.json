@@ -1,1 +1,10 @@
-﻿[{productId:5NN,qty:12},{productId:QUOLINE_80,qty:4}]
+﻿[
+  {
+    "productId": "5NN",
+    "qty": 12
+  },
+  {
+    "productId": "QUOLINE_80",
+    "qty": 4
+  }
+]
