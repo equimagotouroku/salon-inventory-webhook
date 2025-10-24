@@ -4,6 +4,12 @@
 // POST: LINE webhook handler
 
 const TRIGGER_WORDS = ['欲しい', 'ほしい', '発注', '注文', 'お願い', '必要', '下さい', 'ください', '至急', '緊急'];
+// 制限設定（環境変数で制御）
+const ALLOWED_GROUP_IDS = (process.env.ALLOWED_GROUP_IDS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+const REQUIRED_PREFIX = process.env.REQUIRED_PREFIX || '';
 
 function normalizeText(input) {
   if (!input) return '';
@@ -37,6 +43,58 @@ function detectCategory(productCode, text) {
     return { category: 'treatment', type: 'treatment' };
   }
   return { category: 'other', type: 'other' };
+}
+
+// 在庫一覧（ローカルJSONから生成）
+function getInventoryListFromFiles() {
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const candidates = [
+      path.join(__dirname, '..', 'data'),
+      path.join(__dirname, '..', '..', 'apps', 'Hair-Color-AI-Complete-Lab-System-20250127', 'data')
+    ];
+
+    let dataDir = null;
+    for (const p of candidates) {
+      if (fs.existsSync(path.join(p, 'products.json')) && fs.existsSync(path.join(p, 'stock.json'))) {
+        dataDir = p; break;
+      }
+    }
+    if (!dataDir) return null;
+
+    const products = JSON.parse(fs.readFileSync(path.join(dataDir, 'products.json'), 'utf8'));
+    const stock = JSON.parse(fs.readFileSync(path.join(dataDir, 'stock.json'), 'utf8'));
+    const qtyById = new Map(stock.map(s => [s.productId, s.qty]));
+
+    const order = ['color', 'straightening', 'treatment', 'perm', 'styling', 'other'];
+    const label = {
+      color: '【カラー剤】',
+      straightening: '【縮毛矯正（ストレート）】',
+      treatment: '【トリートメント】',
+      perm: '【パーマ剤】',
+      styling: '【スタイリング】',
+      other: '【その他】'
+    };
+
+    let lines = ['📦 在庫一覧', ''];
+    for (const cat of order) {
+      const items = products.filter(p => (p.category || 'other') === cat);
+      if (items.length === 0) continue;
+      lines.push(label[cat] || label.other);
+      for (const p of items) {
+        const q = qtyById.get(p.id) ?? 0;
+        const rp = p.reorderPoint ?? 0;
+        const status = q === 0 ? '🔴 在庫切れ' : q < rp ? '🟡 少ない' : '🟢 十分';
+        lines.push(`・${p.brand ? p.brand + ' ' : ''}${p.id}${p.name && p.name !== p.id ? ' ' + p.name : ''}: ${q}${p.unit || ''} ${status}`);
+      }
+      lines.push('');
+    }
+    return lines.join('\n');
+  } catch (e) {
+    console.error('inventory list (files) error', e);
+    return null;
+  }
 }
 
 function parseInventoryRequest(input) {
@@ -99,24 +157,44 @@ module.exports = async function handler(req, res) {
     for (const event of body.events) {
       if (event.type === 'message' && event.message?.type === 'text') {
         const text = event.message.text || '';
+        // 社内専用ガード: 許可したグループ/ルーム、必要ならプレフィックス必須
+        const isGroup = event.source?.type === 'group' || event.source?.type === 'room';
+        const groupId = event.source?.groupId || event.source?.roomId || '';
+        if (!isGroup) {
+          // 1:1トークでは反応しない
+          continue;
+        }
+        if (ALLOWED_GROUP_IDS.length && !ALLOWED_GROUP_IDS.includes(groupId)) {
+          continue;
+        }
+        if (REQUIRED_PREFIX && !normalizeText(text).startsWith(normalizeText(REQUIRED_PREFIX))) {
+          continue;
+        }
+        const strippedText = REQUIRED_PREFIX ? text.replace(new RegExp('^' + REQUIRED_PREFIX), '') : text;
         let replyMessage;
 
-        if (text === 'ヘルプ' || text.toLowerCase() === 'help') {
+        if (strippedText === 'ヘルプ' || strippedText.toLowerCase() === 'help') {
           replyMessage = {
             type: 'text',
             text: '📦 在庫管理BOT\n\n【在庫リクエスト例】\n・5NN 2本 欲しい\n・GR13 1本 欲しい\n・クオライン80 3本 お願い\n\n【ヒント】数字やスペースが全角でもOK',
           };
+        } else if (strippedText === '在庫一覧') {
+          const textList = getInventoryListFromFiles();
+          replyMessage = {
+            type: 'text',
+            text: textList || '📦 在庫一覧を取得できませんでした（設定ファイル未配置の可能性）',
+          };
         } else {
-          const req = parseInventoryRequest(text);
+          const req = parseInventoryRequest(strippedText);
           if (req) {
-            const cat = detectCategory(req.productCode, text);
+            const cat = detectCategory(req.productCode, strippedText);
             const id = `req_${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0,14)}`;
             console.log('REQUEST', { id, ...req, cat });
             replyMessage = {
               type: 'text',
               text: `✅ 在庫リクエストを受け付けました！\n\nリクエストID: ${id}\n商品: ${req.productCode}\n数量: ${req.quantity}${req.unit}\nカテゴリー: ${cat.category}`,
             };
-          } else if (hasTrigger(text)) {
+          } else if (hasTrigger(strippedText)) {
             replyMessage = {
               type: 'text',
               text: '⚠️ 形式が認識できませんでした。\n例: 5NN 2本 欲しい / GR13 1本 欲しい / クオライン80 3本 お願い',
